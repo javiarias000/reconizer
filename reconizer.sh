@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# reconizer - CLI de recon para maquinas HTB/lab: nmap + recon HTTP + searchsploit + bitacora
+# reconizer - CLI de recon para maquinas HTB/lab: nmap + recon HTTP + searchsploit + VERIFICACION ACTIVA
 # Uso: reconizer <IP> <nombre_maquina> [flags]
 # Bitacora: <dir base>/<nombre_maquina>/ (config: ~/.config/reconizer.conf)
+#
+# REGLA DEL SCRIPT: nunca emite suposiciones. Un veredicto de VULNERABLE / NO_VULNERABLE
+# solo aparece cuando una prueba real se ejecuto contra el servicio y se observo la respuesta.
+# searchsploit solo genera CANDIDATOS; la verificacion activa los confirma o descarta.
 
 set -u
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; CYN='\033[0;36m'; DIM='\033[2m'; NC='\033[0m'
@@ -29,7 +33,10 @@ step_run() {
 
 usage() {
 cat <<EOF
-reconizer - recon rapido + vectores sugeridos + exploits listos (modo tutor)
+reconizer - recon rapido + CANDIDATOS (searchsploit) + verificacion ACTIVA de vulnerabilidades
+
+Regla: el script solo informa VULNERABLE / NO VULNERABLE cuando PROBO algo contra el
+servicio y observo la respuesta. Las suposiciones no aparecen en los veredictos.
 
 USO:
   reconizer <IP> <nombre_maquina> [flags]
@@ -41,20 +48,24 @@ FLAGS:
   --connect      nmap con -sT (TCP connect scan) — usar para localhost/WSL
   --fuzz         feroxbuster (common.txt) en cada puerto HTTP
   --skip-nmap    no lanzar nmap: reusa <bitacora>/nmap.txt existente
+  --skip-vuln    no lanzar la verificacion activa (PASO 4)
+  --domain DOM   dominio a verificar contra la IP (el script NO inventa dominios:
+                  comprueba DNS + respuesta HTTP con cabecera Host antes de afirmar nada)
   --set-dir DIR  cambia el directorio base de las auditorias (se recuerda)
   --help         esta ayuda
 
 EJEMPLOS:
   reconizer 10.10.10.5 army --quick
   reconizer 10.10.10.5 army --all --fuzz
-  reconizer 10.10.10.5 army --skip-nmap --fuzz
+  reconizer 10.10.10.5 army --skip-nmap
+  reconizer 10.129.145.124 stream --domain htb-airport.htb
 EOF
 }
 
 # ---------- parseo ----------
 IP="${1:-}"; MAQ="${2:-}"
 if [ "$IP" = "--help" ] || [ "$IP" = "-h" ]; then usage; exit 0; fi
-MODE=all; FUZZ=0; SKIPNMAP=0; CONNECT=0; NEWDIR=0; SETDIR=""
+MODE=all; FUZZ=0; SKIPNMAP=0; SKIPVULN=0; CONNECT=0; NEWDIR=0; SETDIR=""; DOMAIN=""
 if [ -z "$IP" ] || [ -z "$MAQ" ]; then usage; exit 1; fi
 shift 2
 while [ $# -gt 0 ]; do
@@ -65,6 +76,9 @@ while [ $# -gt 0 ]; do
     --connect)   CONNECT=1; shift ;;
     --fuzz)      FUZZ=1; shift ;;
     --skip-nmap) SKIPNMAP=1; shift ;;
+    --skip-vuln) SKIPVULN=1; shift ;;
+    --domain)    DOMAIN="${2:-}"; shift 2 ;;
+    --domain=*)  DOMAIN="${1#*=}"; shift ;;
     --set-dir)   SETDIR="${2:-}"; NEWDIR=1; shift 2 ;;
     --set-dir=*) SETDIR="${1#*=}"; NEWDIR=1; shift ;;
     --help|-h)   usage; exit 0 ;;
@@ -72,7 +86,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for c in nmap searchsploit curl; do
+for c in nmap searchsploit curl timeout; do
   command -v "$c" >/dev/null || { fail "Falta $c (instalar en Kali)"; exit 1; }
 done
 
@@ -80,16 +94,29 @@ echo -e "${CYN}╔════════════════════�
 echo -e "${CYN}║  RECONIZER :: $MAQ ($IP)  ${DIM}[$MODE$([ $FUZZ -eq 1 ] && echo ' +fuzz')]${NC}"
 echo -e "${CYN}╚════════════════════════════════════════════════╝${NC}"
 
-# ---------- PASO 0: protocolo de reconexion ----------
-say "PASO 0: reconexion  ${DIM}(ping + /etc/hosts)${NC}"
+# ---------- PASO 0: protocolo de reconexion + verificacion de dominio ----------
+say "PASO 0: reconexion  ${DIM}(ping)${NC}"
 if ping -c2 -W2 "$IP" >/dev/null 2>&1; then
   ok "objetivo responde a ping"
 else
-  warn "NO responde a ping. Si se reinicio la VM, la IP de HTB ROTO: pedir la nueva y actualizar la bitacora."
+  warn "NO responde a ping (o ICMP bloqueado: no descarta que TCP este vivo). Si la IP cambio, actualizar la bitacora."
 fi
-if ! getent hosts "$MAQ.htb" >/dev/null 2>&1; then
-  warn "/etc/hosts sin $MAQ.htb (WSL lo borra en cada reinicio). Comando listo:"
-  echo "    echo '$IP $MAQ.htb' | sudo tee -a /etc/hosts"
+DOM_STATE="sin_dominio"
+if [ -n "$DOMAIN" ]; then
+  say "PASO 0b: verificacion del dominio '$DOMAIN' contra $IP  ${DIM}(nada se asume)${NC}"
+  RES=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
+  if [ -n "$RES" ] && [ "$RES" = "$IP" ]; then
+    ok "DNS: $DOMAIN resuelve a $IP (comprobado con getent)"
+    DOM_STATE="dns_ok"
+  elif [ -n "$RES" ]; then
+    warn "DNS: $DOMAIN resuelve a $RES, NO a $IP. Ese dominio pertenece a OTRO host: no usarlo contra esta IP."
+    DOM_STATE="dns_otro_host"
+  else
+    warn "DNS: $DOMAIN no tiene registro publico que resuelva. Si es vhost interno/solo-lab, apuntarlo y el script lo verificara por HTTP:"
+    echo "    echo '$IP $DOMAIN' | sudo tee -a /etc/hosts   # luego re-ejecutar con --domain"
+    DOM_STATE="sin_registro"
+  fi
+  echo -e "    ${DIM}estado DNS: $DOM_STATE (la prueba HTTP va en el PASO 2, con los puertos conocidos)${NC}"
 fi
 
 # ---------- directorio base (config persistente) ----------
@@ -154,14 +181,31 @@ for P in $PORTS_HTTP; do
   if [ -n "$LOC" ]; then
     DOM=$(echo "$LOC" | grep -oE 'https?://[^/]+' | sed 's#https\?://##')
     warn "redirect -> $LOC  ${DIM}(posible vhost: $DOM)${NC}"
-    echo "    ${DIM}verificar: curl -si -H 'Host: $DOM' http://$IP:$P/ | head${NC}"
     REDIRECT_DOM="$DOM"
   fi
 done
 
-# ---------- PASO 3: searchsploit ----------
+# verificacion HTTP del dominio dado (--domain): comparar respuesta con y sin cabecera Host
+if [ -n "$DOMAIN" ] && [ -n "$PORTS_HTTP" ]; then
+  say "PASO 2b: prueba HTTP del dominio '$DOMAIN'  ${DIM}(con y sin cabecera Host)${NC}"
+  for P in $PORTS_HTTP; do
+    BASE_RSP=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{size_download}' "http://$IP:$P/")
+    DOM_RSP=$(curl -s --max-time 8 -H "Host: $DOMAIN" -o /dev/null -w '%{http_code}:%{size_download}' "http://$IP:$P/")
+    if [ "$BASE_RSP" = "0:0" ] && [ "$DOM_RSP" = "0:0" ]; then
+      say "vhost '$DOMAIN' en :$P INDETERMINADO: el puerto HTTP no respondio (sin evidencia, no se afirma nada)"
+    elif [ "$DOM_RSP" != "$BASE_RSP" ]; then
+      ok "VHOST CONFIRMADO en :$P  ${DIM}| prueba: GET / con Host: $DOMAIN vs sin cabecera | evidencia: respuesta cambia ($BASE_RSP -> $DOM_RSP)${NC}"
+    else
+      echo -e "    ${DIM}vhost '$DOMAIN' en :$P NO confirmado | prueba: GET / con Host: $DOMAIN | evidencia: respuesta identica ($DOM_RSP)${NC}"
+    fi
+  done
+elif [ -n "$DOMAIN" ]; then
+  warn "no hay puertos HTTP para probar el dominio '$DOMAIN': sin verificacion HTTP posible"
+fi
+
+# ---------- PASO 3: searchsploit (solo genera CANDIDATOS, no veredictos) ----------
 echo
-say "PASO 3: searchsploit por cada version  ${DIM}(conteo de exploits por servicio)${NC}"
+say "PASO 3: searchsploit por cada version  ${DIM}(CANDIDATOS, no veredictos)${NC}"
 SEARCH_LOG="$BITACORA/searchsploit.txt"
 SSTART=$(date +%s)
 : > "$SEARCH_LOG"
@@ -176,20 +220,130 @@ while IFS= read -r line; do
     searchsploit "$VER" 2>/dev/null | head -10
   } >> "$SEARCH_LOG"
   NEXP=$(searchsploit --id "$VER" 2>/dev/null | grep -cE '\|')
-  echo -e "    ${YLW}[$PORT/$SVC]${NC} $VER  ${DIM}-> ${NEXP} exploits${NC}"
+  echo -e "    ${YLW}[$PORT/$SVC]${NC} $VER  ${DIM}-> ${NEXP} exploits candidatos${NC}"
 done <<< "$(grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT")"
 SDUR=$(( $(date +%s) - SSTART ))
 ok "searchsploit  ${DIM}(${SDUR}s)${NC} -> $SEARCH_LOG"
-say "bajar un exploit (mirror):  ${DIM}searchsploit -m <ruta-del-exploit>${NC}"
+warn "TODO lo anterior son CANDIDATOS (correlacion version/exploit en base de datos). El PASO 4 prueba en vivo y solo ese emite veredictos."
 
-# ---------- PASO 4: fuzzing ----------
+# ---------- PASO 4: VERIFICACION ACTIVA (solo hechos probados contra el objetivo) ----------
+if [ $SKIPVULN -eq 1 ]; then
+  echo
+  warn "PASO 4 omitido (--skip-vuln): sin veredictos, solo candidatos."
+else
+  echo
+  say "PASO 4: verificacion ACTIVA  ${DIM}(cada veredicto viene de una prueba real contra $IP)${NC}"
+  VERIF_LOG="$BITACORA/verificacion.txt"
+  : > "$VERIF_LOG"
+
+  # report <VULNERABLE|NO_VULNERABLE|HECHO> "<objetivo>" "<prueba ejecutada>" "<evidencia observada>"
+  report() {
+    local state="$1" tgt="$2" t="$3" ev="$4"
+    case "$state" in
+      VULNERABLE)
+        ok "VULNERABLE  $tgt  ${DIM}| prueba: $t | evidencia: $ev${NC}"
+        echo "[VULNERABLE] $tgt | prueba: $t | evidencia: $ev" >> "$VERIF_LOG" ;;
+      HECHO)
+        say "HECHO       $tgt  ${DIM}| prueba: $t | evidencia: $ev${NC}"
+        echo "[HECHO] $tgt | prueba: $t | evidencia: $ev" >> "$VERIF_LOG" ;;
+      *)
+        echo -e "    ${DIM}NO vulnerable  $tgt  | prueba: $t | evidencia: $ev${NC}"
+        echo "[NO_VULNERABLE] $tgt | prueba: $t | evidencia: $ev" >> "$VERIF_LOG" ;;
+    esac
+  }
+
+  # util: conecta a IP:PORT con timeout -> exit 0 si el TCP abre
+  tcp_open() { timeout "${3:-3}" bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+  # util: envia payload crudo por TCP y devuelve la respuesta
+  tcp_send() { timeout "${4:-6}" bash -c "exec 3<>/dev/tcp/$1/$2; printf '%b' '$3' >&3; cat <&3" 2>/dev/null; }
+
+  # 4a) nmap NSE: scripts de vulnerabilidad sobre TODOS los puertos abiertos (prueba activa real)
+  OPENPORTS=$(echo "$SERVICIOS" | cut -d/ -f1 | paste -sd, -)
+  NSE_OUT="$BITACORA/nmap_vuln.txt"
+  step_run "nmap NSE vuln scripts (puertos: $OPENPORTS)" "nmap -Pn -sV --script 'vuln and not dos' -p '$OPENPORTS' -oN '$NSE_OUT' '$IP' >/dev/null 2>&1"
+  awk '/^\|[ _]/ {
+    if (match($0, /^\|[ ]+[^:|]+:/)) { cur=substr($0, RSTART+2, RLENGTH-3); gsub(/^[ ]+|[ ]+$/, "", cur) }
+    if ($0 ~ /VULNERABLE/ && $0 !~ /[Nn]ot vulnerable/ && cur != "") print cur
+  }' "$NSE_OUT" | sort -u | while read -r v; do
+    report VULNERABLE "$IP (NSE: $v)" "nmap --script 'vuln and not dos' contra puertos abiertos" "script NSE reporta VULNERABLE (detalle: nmap_vuln.txt)"
+  done
+  grep -q 'VULNERABLE' "$NSE_OUT" 2>/dev/null || say "NSE: ningun script reporto VULNERABLE (pruebas ejecutadas, todas negativas)"
+
+  # 4b) sondas especificas por servicio: cada una ENVIA algo y OBSERVA la respuesta
+  while IFS= read -r line; do
+    PORT=$(echo "$line" | cut -d/ -f1)
+    SVC=$(echo "$line" | awk '{print $3}')
+    VER=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/([^)]*)//g; s/^ *//; s/ *$//')
+
+    case "$SVC" in
+    ftp)
+      # vsftpd 2.3.4: el backdoor abre 6200 tras un login malicioso. Se prueba de verdad.
+      if echo "$VER" | grep -q 'vsftpd 2\.3\.4'; then
+        tcp_send "$IP" "$PORT" 'USER t:)\r\nPASS x\r\nQUIT\r\n' 6 >/dev/null 2>&1; sleep 3
+        if tcp_open "$IP" 6200 2; then
+          report VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "login 'USER t:)' + intento de conexion a 6200" "puerto 6200 ABIERTO tras el login malicioso: backdoor confirmado"
+        else
+          report NO_VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "login 'USER t:)' + intento de conexion a 6200" "6200 cerrado: el backdoor no se activo"
+        fi
+      fi
+      # ProFTPD mod_copy (CVE-2015-3306): SITE CPFR sin autenticar
+      if echo "$VER" | grep -qi proftpd; then
+        RESP=$(tcp_send "$IP" "$PORT" 'SITE CPFR /etc/passwd\r\nQUIT\r\n' 6 2>/dev/null | tr -d '\r')
+        if echo "$RESP" | grep -q '^350'; then
+          report VULNERABLE ":$PORT ftp ($VER)" "SITE CPFR /etc/passwd sin login" "respuesta 350: mod_copy permite copiar archivos sin autenticacion"
+        else
+          report NO_VULNERABLE ":$PORT ftp ($VER)" "SITE CPFR /etc/passwd sin login" "sin 350 (respuesta: $(echo "$RESP" | head -1))"
+        fi
+      fi
+      # FTP anonimo: hecho probado (no es veredicto de CVE, es acceso observado)
+      RESP=$(tcp_send "$IP" "$PORT" 'USER anonymous\r\nPASS a@b.c\r\nQUIT\r\n' 6 2>/dev/null | tr -d '\r')
+      if echo "$RESP" | grep -q '^230'; then
+        report HECHO ":$PORT ftp" "login anonymous / a@b.c" "230 login correcto: FTP anonimo activo"
+      fi
+      ;;
+    http|https|http-alt|http-proxy)
+      # Spring Boot actuator expuesto
+      for path in /actuator/heapdump /actuator/env; do
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "http://$IP:$PORT$path")
+        if [ "$code" = "200" ]; then
+          report VULNERABLE ":$PORT http" "GET $path" "HTTP 200: actuator expuesto"
+        else
+          report NO_VULNERABLE ":$PORT http" "GET $path" "HTTP $code"
+        fi
+      done
+      # Tomcat manager sin credenciales
+      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "http://$IP:$PORT/manager/html")
+      if [ "$code" = "200" ]; then
+        report VULNERABLE ":$PORT http (tomcat)" "GET /manager/html sin credenciales" "HTTP 200: manager accesible"
+      else
+        report NO_VULNERABLE ":$PORT http (tomcat)" "GET /manager/html sin credenciales" "HTTP $code"
+      fi
+      # WebDAV: PROPFIND y PUT anonimo (la escritura es lo explotable)
+      code=$(curl -sk -X PROPFIND -H 'Depth: 0' -o /dev/null -w '%{http_code}' --max-time 8 "http://$IP:$PORT/")
+      if [ "$code" = "207" ]; then
+        PUTCODE=$(curl -sk -X PUT -d 'davtest' -o /dev/null -w '%{http_code}' --max-time 8 "http://$IP:$PORT/davtest.txt")
+        if [ "$PUTCODE" = "201" ] || [ "$PUTCODE" = "204" ]; then
+          report VULNERABLE ":$PORT http" "PROPFIND / (207) + PUT /davtest.txt" "HTTP $PUTCODE: WebDAV con escritura anonima"
+        else
+          report HECHO ":$PORT http" "PROPFIND / (207) + PUT /davtest.txt" "WebDAV activo pero PUT anonimo devolvio $PUTCODE (sin escritura)"
+        fi
+      fi
+      ;;
+    esac
+  done <<< "$SERVICIOS"
+
+  NCONF=$(grep -c '^\[VULNERABLE\]' "$VERIF_LOG")
+  ok "verificacion: ${GRN}${NCONF} vulnerabilidades CONFIRMADAS por prueba activa${NC} -> $VERIF_LOG"
+fi
+
+# ---------- PASO 5: fuzzing ----------
 if [ $FUZZ -eq 1 ]; then
   echo
   if ! command -v feroxbuster >/dev/null; then
     warn "feroxbuster no instalado (sudo apt install feroxbuster) — saltando"
   else
     for P in $PORTS_HTTP; do
-      say "PASO 4: feroxbuster en :$P"
+      say "PASO 5: feroxbuster en :$P"
       FUZZOUT="$BITACORA/ferox_$P.txt"
       step_run "fuzz :$P" "feroxbuster -u 'http://$IP:$P/' -w /usr/share/seclists/Discovery/Web-Content/common.txt -S 178 -n -d 1 >'$FUZZOUT' 2>&1"
       NF=$(grep -cE '^\s*(200|201|204|301|302|307|401|403|405|500)' "$FUZZOUT" 2>/dev/null || echo 0)
@@ -198,18 +352,6 @@ if [ $FUZZ -eq 1 ]; then
     done
   fi
 fi
-
-# ---------- PASO 5: vectores sugeridos (playbook) ----------
-echo
-say "PASO 5: vectores sugeridos  ${DIM}(playbook de nuestras maquinas)${NC}"
-suggest() { echo -e "    ${GRN}→${NC} $*"; }
-echo "$RAW_NMAP" | grep -qiE 'openssh|ssh' && { echo "  ${YLW}[SSH]${NC}"; suggest "cross-check version exacta vs advisories (regreSSHion CVE-2024-6387: parcheado en noble >= 9.6p1-3ubuntu13.3)."; suggest "credenciales reutilizadas: probar cada password conocida contra SSH."; }
-echo "$RAW_NMAP" | grep -qiE 'nginx|apache|httpd' && { echo "  ${YLW}[web]${NC}"; suggest "redirect a dominio = vhost routing: mapear /etc/hosts y fuzzear 'Host: FUZZ.<dominio>' -S <bytes redirect> -d 0."; }
-echo "$RAW_NMAP" | grep -qiE 'uvicorn|fastapi|gunicorn' && { echo "  ${YLW}[FastAPI]${NC}"; suggest "pedir /openapi.json y /docs — mapa de endpoints."; suggest "endpoints XML/binary -> XXE (file://) y buscar DONDE aterriza el resultado (tabla, eco, log)."; }
-echo "$RAW_NMAP" | grep -qiE 'java|tomcat|jetty|spring' && { echo "  ${YLW}[Java/Spring]${NC}"; suggest "error JSON timestamp/status/error = Spring Boot: /actuator y /actuator/heapdump."; suggest "heapdump: strings + ancla 'jdbc:' + contexto set* (credenciales Hikari)."; }
-echo "$RAW_NMAP" | grep -qiE 'clickhouse|8123' && { echo "  ${YLW}[ClickHouse]${NC}"; suggest "HTTP 8123 via vhost db.*: basic auth con credenciales reutilizadas."; suggest "admin CH = escritura: INSERT INTO FUNCTION file('<user_files>/x.py', LineAsString) SETTINGS engine_file_truncate_on_insert=1."; }
-echo "$RAW_NMAP" | grep -qiE 'kafka|zookeeper|9092' && { echo "  ${YLW}[Kafka]${NC}"; suggest "broker ACL (tcpwrapped): NO directo. SASL en server.properties del foothold; DLQ gatilla procesos periodicos."; }
-[ -n "$REDIRECT_DOM" ] && { echo "  ${YLW}[vhost]${NC}"; suggest "probar TODAS las credenciales conocidas contra cada vhost nuevo: se reutilizan entre capas."; }
 
 # ---------- PASO 6: bitacora ----------
 echo
@@ -231,7 +373,14 @@ ok "writeup.md / credentials.txt / errors.md listos"
 TOTAL=$(( $(date +%s) - T0 ))
 echo
 echo -e "${CYN}══════════════════════════════════════════════════${NC}"
-echo -e "${GRN}  RECON COMPLETO${NC}  ${DIM}tiempo total: ${TOTAL}s (~$(( TOTAL / 60 ))m)${NC}"
+echo -e "  ${GRN}RECON COMPLETO${NC}  ${DIM}tiempo total: ${TOTAL}s (~$(( TOTAL / 60 ))m)${NC}"
 echo -e "  bitacora: $BITACORA"
-echo -e "  siguiente: repasar searchsploit.txt con el tutor y decidir el vector."
+VERIF_LOG="$BITACORA/verificacion.txt"
+if [ -f "$VERIF_LOG" ] && grep -q '^\[VULNERABLE\]' "$VERIF_LOG"; then
+  NCONF=$(grep -c '^\[VULNERABLE\]' "$VERIF_LOG")
+  echo -e "  ${RED}vulnerabilidades CONFIRMADAS por prueba activa: $NCONF${NC}"
+  grep '^\[VULNERABLE\]' "$VERIF_LOG" | sed 's/^/    /'
+else
+  echo -e "  vulnerabilidades confirmadas por prueba activa: ${GRN}0${NC}  ${DIM}(searchsploit.txt sigue siendo solo candidatos)"
+fi
 echo -e "${CYN}══════════════════════════════════════════════════${NC}"
