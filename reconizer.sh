@@ -70,6 +70,8 @@ FLAGS:
   --skip-vuln    no lanzar la verificacion activa (PASO 4)
   --domain DOM   dominio a verificar contra la IP (el script NO inventa dominios:
                   comprueba DNS + respuesta HTTP con cabecera Host antes de afirmar nada)
+  --no-hosts     no tocar /etc/hosts (WSL) ni el hosts de Windows (PASO 2d se omite)
+  --no-browser   no abrir el navegador de Windows con el dominio confirmado
   --set-dir DIR  cambia el directorio base de las auditorias (se recuerda)
   --help         esta ayuda
 
@@ -88,7 +90,7 @@ EOF
 IP="${1:-}"; MAQ="${2:-}"
 if [ "$IP" = "--help" ] || [ "$IP" = "-h" ]; then usage; exit 0; fi
 MODE=all; FUZZ=0; SKIPNMAP=0; SKIPVULN=0; CONNECT=0; NEWDIR=0; SETDIR=""; DOMAIN=""
-UDP=0; NUCLEI=0; SHOTS=0
+UDP=0; NUCLEI=0; SHOTS=0; NOHOSTS=0; NOBROWSER=0
 if [ -z "$IP" ] || [ -z "$MAQ" ]; then usage; exit 1; fi
 # saneo basico: $IP se interpola en comandos bash -c mas abajo (nmap/curl/tcp_*).
 # Sin esto, un typo o copy-paste raro en la IP se ejecuta como shell.
@@ -113,6 +115,8 @@ while [ $# -gt 0 ]; do
     --skip-vuln) SKIPVULN=1; shift ;;
     --domain)    DOMAIN="${2:-}"; shift 2 ;;
     --domain=*)  DOMAIN="${1#*=}"; shift ;;
+    --no-hosts)    NOHOSTS=1; shift ;;
+    --no-browser)  NOBROWSER=1; shift ;;
     --set-dir)   SETDIR="${2:-}"; NEWDIR=1; shift 2 ;;
     --set-dir=*) SETDIR="${1#*=}"; NEWDIR=1; shift ;;
     --help|-h)   usage; exit 0 ;;
@@ -260,7 +264,7 @@ for P in $PORTS_HTTP; do
   if [ -n "$LOC" ]; then
     DOM=$(echo "$LOC" | grep -oE 'https?://[^/]+' | sed 's#https\?://##')
     warn "redirect -> $LOC  ${DIM}(posible vhost: $DOM)${NC}"
-    REDIRECT_DOM="$DOM"
+    [ -z "$REDIRECT_DOM" ] && REDIRECT_DOM="$DOM"   # el PRIMER redirect gana (no se sobreescribe)
   fi
 done
 
@@ -281,6 +285,134 @@ if [ -n "$DOMAIN" ] && [ -n "$PORTS_HTTP" ]; then
   done
 elif [ -n "$DOMAIN" ]; then
   warn "no hay puertos HTTP para probar el dominio '$DOMAIN': sin verificacion HTTP posible"
+fi
+
+# ---------- PASO 2d: dominio dado/detectado -> resolucion local (WSL + Windows) + navegador ----------
+# REGLA (no negociable): el dominio NUNCA se inventa. Solo se usa uno explicito (--domain) o
+# uno DETECTADO en respuestas reales del objetivo: Location: de un redirect (PASO 2) o
+# commonName= del certificado TLS (nmap.txt). Y antes de tocar hosts SE PRUEBA en vivo
+# (GET / con cabecera Host) y se verifica DNS: nada se afirma sin observar la respuesta.
+# Por que el hosts de Windows: Firefox/Chrome de Windows NO leen el /etc/hosts de WSL;
+# resuelven con C:\Windows\System32\drivers\etc\hosts. Escribir solo el de WSL es la causa
+# del clasico "agrego el dominio y el navegador no logra conectarse".
+HOSTS_WSL="${RECONIZER_HOSTS:-/etc/hosts}"          # override de prueba: RECONIZER_HOSTS=archivo temporal
+HOSTS_WIN="${RECONIZER_WINHOSTS:-/mnt/c/Windows/System32/drivers/etc/hosts}"
+AUTO_DOM="$DOMAIN"
+[ -z "$AUTO_DOM" ] && AUTO_DOM="$REDIRECT_DOM"
+if [ -z "$AUTO_DOM" ]; then
+  CERT_DOM=$(grep -oE 'commonName=[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+' "$NMAP_OUT" | head -1 | cut -d= -f2-)
+  if [ -n "$CERT_DOM" ] && [ "$CERT_DOM" != "$IP" ]; then
+    say "PASO 2d: dominio detectado en el certificado TLS: '$CERT_DOM'  ${DIM}| evidencia: commonName= en nmap.txt${NC}"
+    AUTO_DOM="$CERT_DOM"
+  fi
+fi
+# saneo: debe parecer un dominio (tener punto) y NO ser la IP misma (redirect a la IP no es vhost)
+if [ -n "$AUTO_DOM" ]; then
+  case "$AUTO_DOM" in *.*) ;; *) AUTO_DOM="";; esac
+  [ "$AUTO_DOM" = "$IP" ] && AUTO_DOM=""
+fi
+if [ $NOHOSTS -eq 1 ]; then
+  say "PASO 2d: omitido (--no-hosts): no se toca /etc/hosts ni el hosts de Windows"
+elif [ -z "$AUTO_DOM" ]; then
+  say "PASO 2d: sin dominio (dado con --domain o detectado en las respuestas): nada que apuntar"
+elif [ -z "$PORTS_HTTP" ]; then
+  say "PASO 2d: '$AUTO_DOM' detectado pero sin puertos HTTP abiertos: no hay nada que responder, no se toca hosts"
+else
+  say "PASO 2d: '$AUTO_DOM' -> hosts (WSL + Windows) + navegador  ${DIM}(--no-hosts/--no-browser para saltar)${NC}"
+  # GATE 1 DNS: si el dominio resuelve PUBLICAMENTE a otra IP, escribirlo en hosts seria
+  # secuestrar un dominio real -> no se hace.
+  RES0=$(getent hosts "$AUTO_DOM" 2>/dev/null | awk '{print $1}' | head -1)
+  # GATE 2 HTTP: probar en vivo que ESTE servidor responde a ese Host en ESTA IP.
+  DOM_OK_PORT=""; DOM_OK_CODE=""
+  for P in $PORTS_HTTP; do
+    SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
+    CODE=$(curl -sk --max-time 8 -H "Host: $AUTO_DOM" -o /dev/null -w '%{http_code}' "$SCH://$IP:$P/" 2>/dev/null)
+    if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then DOM_OK_PORT="$P"; DOM_OK_CODE="$CODE"; DOM_OK_SCH="$SCH"; break; fi
+  done
+  if [ -n "$RES0" ] && [ "$RES0" != "$IP" ]; then
+    warn "PASO 2d: '$AUTO_DOM' resuelve publicamente a $RES0, NO a $IP: es un dominio REAL de otro host. NO se toca hosts."
+  elif [ -z "$DOM_OK_PORT" ]; then
+    warn "PASO 2d: '$AUTO_DOM' NO respondio con esa cabecera Host en ningun puerto HTTP: sin evidencia no se escribe hosts"
+  else
+    ok "'$AUTO_DOM' responde en :$DOM_OK_PORT  ${DIM}| prueba: GET $DOM_OK_SCH://$IP:$DOM_OK_PORT/ con Host: $AUTO_DOM | evidencia: HTTP $DOM_OK_CODE${NC}"
+    ENTRY="$IP $AUTO_DOM"
+    hosts_has() { grep -Eq "^[^#]*[[:space:]]$AUTO_DOM([[:space:]]|$)" "$1" 2>/dev/null; }
+    # (a) /etc/hosts de WSL: para que curl/nmap/feroxbuster/nuclei de Kali resuelvan el dominio
+    if hosts_has "$HOSTS_WSL"; then
+      ok "$HOSTS_WSL ya contiene '$AUTO_DOM' (nada que agregar)"
+    elif echo "$ENTRY" >> "$HOSTS_WSL" 2>/dev/null; then
+      ok "$HOSTS_WSL: agregado '$ENTRY'"
+    elif echo "$ENTRY" | sudo tee -a "$HOSTS_WSL" >/dev/null 2>&1; then
+      ok "$HOSTS_WSL: agregado '$ENTRY' ${DIM}(con sudo)${NC}"
+    else
+      warn "$HOSTS_WSL: no pude escribir (ni directo ni sudo). Agregar a mano y re-ejecutar:"
+      echo "    echo '$ENTRY' | sudo tee -a $HOSTS_WSL"
+    fi
+    RESW=$(getent hosts "$AUTO_DOM" 2>/dev/null | awk '{print $1}' | head -1)
+    if [ "$RESW" = "$IP" ]; then
+      ok "verificado desde WSL: $AUTO_DOM -> $RESW  ${DIM}(getent: las herramientas de Kali ya resuelven)${NC}"
+    else
+      warn "desde WSL '$AUTO_DOM' aun no resuelve a $IP (${RESW:-sin resolver}): las herramientas usaran la IP"
+    fi
+    # (b) hosts de WINDOWS (la correccion del bug "Firefox no conecta"):
+    if [ -f "$HOSTS_WIN" ]; then
+      if hosts_has "$HOSTS_WIN"; then
+        ok "hosts de Windows ya contiene '$AUTO_DOM'"
+      else
+        printf 'Add-Content -Path "$env:windir\\System32\\drivers\\etc\\hosts" -Value "%s %s"\r\n' "$IP" "$AUTO_DOM" > "$BITACORA/add_hosts.ps1"
+        if echo "$ENTRY" >> "$HOSTS_WIN" 2>/dev/null && hosts_has "$HOSTS_WIN"; then
+          ok "hosts de Windows: agregado '$ENTRY' ${DIM}(escritura directa, sin elevacion)${NC}"
+        elif command -v powershell.exe >/dev/null 2>&1 || [ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]; then
+          warn "hosts de Windows pide admin: VA A APARECER UN AVISO DE UAC -> aceptarlo (agrega '$ENTRY')"
+          WINP=$(wslpath -w "$BITACORA/add_hosts.ps1" 2>/dev/null)
+          powershell.exe -NoProfile -Command "Start-Process -Verb RunAs powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$WINP'" >/dev/null 2>&1
+          WOK=""
+          for i in $(seq 1 20); do   # esperar el UAC + PowerShell elevado, verificando de vuelta (max 20s)
+            hosts_has "$HOSTS_WIN" && { WOK=1; break; }
+            sleep 1
+          done
+          if [ -n "$WOK" ]; then
+            ok "hosts de Windows: entrada '$ENTRY' verificada de vuelta ${DIM}(UAC aceptado)${NC}"
+          else
+            warn "hosts de Windows SIN la entrada tras 20s (UAC no aceptado?): ejecutar como admin -> $WINP"
+          fi
+        else
+          warn "no puedo escribir el hosts de Windows (ni directo ni powershell.exe): agregar a mano '$ENTRY'"
+        fi
+      fi
+      # refrescar la cache DNS de Windows: sin esto la entrada cuenta tras reiniciar, no ya
+      ipconfig.exe /flushdns >/dev/null 2>&1 || true
+      # verificacion desde el LADO WINDOWS (prueba real, no suposicion): ping.exe SI lee el hosts de Windows
+      PRES=$(cd /mnt/c 2>/dev/null && /mnt/c/Windows/System32/ping.exe -n 1 -w 2000 "$AUTO_DOM" 2>/dev/null | grep -oE "\[$IP\]" | head -1)
+      if [ "$PRES" = "[$IP]" ]; then
+        ok "verificado desde WINDOWS: $AUTO_DOM -> $IP  ${DIM}(ping.exe: el navegador va a conectar)${NC}"
+      else
+        warn "ping.exe no mostro $AUTO_DOM -> $IP (${PRES:-sin respuesta}): si el navegador falla, revisar la entrada a mano"
+      fi
+    else
+      say "sin hosts de Windows accesible (${DIM}$HOSTS_WIN${NC}): probablemente no es WSL, solo aplica el de WSL"
+    fi
+    # (c) abrir el navegador de WINDOWS con el dominio (por IP el vhost no sirve en HTB)
+    if [ $NOBROWSER -eq 1 ]; then
+      say "navegador NO abierto (--no-browser)"
+    else
+      URL="${DOM_OK_SCH}://$AUTO_DOM/"
+      if [ -f "$HOSTS_WIN" ] && ! hosts_has "$HOSTS_WIN"; then
+        warn "navegador NO abierto: falta la entrada en el hosts de Windows (sin ella Firefox no conecta). Abrir a mano: $URL"
+      else
+        FF="/mnt/c/Program Files/Mozilla Firefox/firefox.exe"
+        if [ -f "$FF" ]; then
+          (cd /mnt/c 2>/dev/null; "$FF" -new-tab "$URL" >/dev/null 2>&1 &)
+          ok "Firefox abierto con $URL"
+        elif [ -x /mnt/c/Windows/System32/cmd.exe ]; then
+          (cd /mnt/c 2>/dev/null; /mnt/c/Windows/System32/cmd.exe /c start "" "$URL" >/dev/null 2>&1 &)
+          ok "navegador por defecto (cmd start) abierto con $URL"
+        else
+          warn "no encontre navegador de Windows: abrir a mano $URL"
+        fi
+      fi
+    fi
+  fi
 fi
 
 # ---------- PASO 2c: screenshots (--shots) ----------
