@@ -16,19 +16,32 @@ warn() { echo -e "${YLW}[!]${NC} $*"; }
 fail() { echo -e "${RED}[-]${NC} $*"; }
 T0=$(date +%s)
 
-# [fix 10] Ctrl-C / TERM no deja nmap/feroxbuster huerfanos en background
-trap 'kill $(jobs -p) 2>/dev/null' INT TERM EXIT
+# http_scheme SVC PORT -> "http" o "https". Antes el script usaba "http://" a lo ciego
+# en TODAS las sondas: contra un puerto TLS (ssl/http, 443, 8443...) eso falla silenciosamente
+# (reset/empty reply) y el resultado era un falso NO_VULNERABLE por protocolo equivocado, no
+# por ausencia real del problema.
+http_scheme() {
+  case "$1" in *ssl*|https) echo https; return ;; esac
+  case "$2" in 443|8443|9443) echo https ;; *) echo http ;; esac
+}
+
+# limpieza: si Ctrl-C mata el script, no deja nmap/feroxbuster huerfanos en background
+_CPID=""
+cleanup() { [ -n "$_CPID" ] && kill "$_CPID" 2>/dev/null; exit 130; }
+trap cleanup INT TERM
 
 # step_run "<label>" "<comando>" — spinner + cronometro en vivo; al terminar "[+] label (Ns)"
 step_run() {
   local label="$1"; local cmd="$2"; local i=0
   bash -c "$cmd" &
   local pid=$!
+  _CPID=$pid
   while kill -0 "$pid" 2>/dev/null; do
     printf "\r    \033[36m%s\033[0m \033[2m%s...\033[0m  \033[33m%ds\033[0m   " "${SPIN:i%10:1}" "$label" "$i"
     sleep 1; i=$((i+1))
   done
   wait "$pid"; local rc=$?
+  _CPID=""
   printf "\r\033[K"
   if [ $rc -eq 0 ]; then ok "$label  ${DIM}(${i}s)${NC}"; else fail "$label fallo (exit $rc, ${i}s)"; fi
   return $rc
@@ -68,11 +81,16 @@ EOF
 # ---------- parseo ----------
 IP="${1:-}"; MAQ="${2:-}"
 if [ "$IP" = "--help" ] || [ "$IP" = "-h" ]; then usage; exit 0; fi
-# [fix 8] validar IP/nombre ANTES de que lleguen a ningun bash -c / ruta de bitacora
-if ! [[ "$IP" =~ ^[A-Za-z0-9._:-]+$ ]]; then fail "IP con caracteres no permitidos: '$IP'"; exit 1; fi
-if ! [[ "$MAQ" =~ ^[A-Za-z0-9._-]+$ ]]; then fail "nombre de maquina con caracteres no permitidos: '$MAQ'"; exit 1; fi
 MODE=all; FUZZ=0; SKIPNMAP=0; SKIPVULN=0; CONNECT=0; NEWDIR=0; SETDIR=""; DOMAIN=""
 if [ -z "$IP" ] || [ -z "$MAQ" ]; then usage; exit 1; fi
+# saneo basico: $IP se interpola en comandos bash -c mas abajo (nmap/curl/tcp_*).
+# Sin esto, un typo o copy-paste raro en la IP se ejecuta como shell.
+if ! [[ "$IP" =~ ^[A-Za-z0-9.:-]+$ ]]; then
+  fail "host/IP con caracteres invalidos: '$IP'"; exit 1
+fi
+if ! [[ "$MAQ" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  fail "nombre de maquina invalido (sin '/' ni espacios): '$MAQ'"; exit 1
+fi
 shift 2
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -161,7 +179,9 @@ else
     all)   OPTS="-sV -sC -T4 -Pn --min-rate 2000 -p-" ;;
     deep)  OPTS="-sV -sC -A -T4 -Pn --min-rate 2000 -p-" ;;
   esac
-  # [fix 5] --connect agrega -sT SIN matar el -sV: sin versiones no hay candidatos en searchsploit
+  # --connect: TCP connect scan (-sT) — necesario para localhost (WSL2 no responde SYN raw a su propio loopback)
+  # -sT y -sV NO son excluyentes en nmap (tipo de scan vs deteccion de version): antes este sed
+  # borraba -sV por error, dejando VER vacio en PASO 3/4 y matando searchsploit entero con --connect.
   [ $CONNECT -eq 1 ] && OPTS="-sT $OPTS"
   step_run "nmap escaneando" "nmap $OPTS -oN '$NMAP_OUT' '$IP'"
 fi
@@ -174,27 +194,17 @@ echo "$SERVICIOS" | sed 's/^/    /'
 
 # ---------- PASO 2: recon HTTP (solo headers clave) ----------
 RAW_NMAP=$(cat "$NMAP_OUT")
-# [fix 3] scheme_for PUERTO: devuelve https:// o http:// segun como responda el puerto (nada hardcodeado)
-scheme_for() {
-  local code
-  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$1:$2/" 2>/dev/null)
-  if [ -n "$code" ] && [ "$code" != "000" ]; then echo "https://"; else echo "http://"; fi
-}
 PORTS_HTTP=$( { grep -E '^[0-9]+/tcp\s+open\s+http' "$NMAP_OUT" | cut -d/ -f1
   echo "$RAW_NMAP" | grep -iE 'uvicorn|nginx|apache|tomcat|jetty|httpd|gunicorn' | grep -E '^[0-9]+/tcp\s+open' | cut -d/ -f1
-} | sort -u | grep -v '^$' || true )
-PORTS_HTTP=$( { grep -E '^[0-9]+/tcp\s+open\s+(https|http|http-alt|http-proxy|https-alt)' "$NMAP_OUT" | cut -d/ -f1
-  echo "$PORTS_HTTP"
 } | sort -u | grep -v '^$' || true )
 REDIRECT_DOM=""
 for P in $PORTS_HTTP; do
   echo
-  say "PASO 2: HTTP en :$P  ${DIM}(headers clave)${NC}"
-  SCHEME=$(scheme_for "$IP" "$P")
-  say "    esquema detectado: $SCHEME  ${DIM}(https probe primero)${NC}"
-  curl -ski --max-time 10 "$SCHEME$IP:$P/" 2>/dev/null \
+  SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
+  say "PASO 2: $SCH en :$P  ${DIM}(headers clave)${NC}"
+  curl -sik --max-time 10 "$SCH://$IP:$P/" 2>/dev/null \
     | grep -iE '^(HTTP/|server:|location:|x-powered|content-type:)' | head -6 | sed 's/^/    /'
-  LOC=$(curl -ski --max-time 10 "$SCHEME$IP:$P/" 2>/dev/null | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+  LOC=$(curl -sik --max-time 10 "$SCH://$IP:$P/" 2>/dev/null | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
   if [ -n "$LOC" ]; then
     DOM=$(echo "$LOC" | grep -oE 'https?://[^/]+' | sed 's#https\?://##')
     warn "redirect -> $LOC  ${DIM}(posible vhost: $DOM)${NC}"
@@ -206,9 +216,9 @@ done
 if [ -n "$DOMAIN" ] && [ -n "$PORTS_HTTP" ]; then
   say "PASO 2b: prueba HTTP del dominio '$DOMAIN'  ${DIM}(con y sin cabecera Host)${NC}"
   for P in $PORTS_HTTP; do
-    SCHEME=$(scheme_for "$IP" "$P")
-    BASE_RSP=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}:%{size_download}' "$SCHEME$IP:$P/")
-    DOM_RSP=$(curl -sk --max-time 8 -H "Host: $DOMAIN" -o /dev/null -w '%{http_code}:%{size_download}' "$SCHEME$IP:$P/")
+    SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
+    BASE_RSP=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}:%{size_download}' "$SCH://$IP:$P/")
+    DOM_RSP=$(curl -sk --max-time 8 -H "Host: $DOMAIN" -o /dev/null -w '%{http_code}:%{size_download}' "$SCH://$IP:$P/")
     if [ "$BASE_RSP" = "0:0" ] && [ "$DOM_RSP" = "0:0" ]; then
       say "vhost '$DOMAIN' en :$P INDETERMINADO: el puerto HTTP no respondio (sin evidencia, no se afirma nada)"
     elif [ "$DOM_RSP" != "$BASE_RSP" ]; then
@@ -230,7 +240,11 @@ SSTART=$(date +%s)
 while IFS= read -r line; do
   PORT=$(echo "$line" | cut -d/ -f1)
   SVC=$(echo "$line" | awk '{print $3}')
-  VER=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' | sed -E 's/\([^)]*\)//g; s/\([^)]*\)//g; s/[()]//g; s/  +/ /g; s/^ //; s/ $//')
+  # s/([^)]*)//g sola dejaba un ")" suelto con parentesis anidados tipo "((Ubuntu))" (comun en
+  # nmap). El bucle :a;...;ta repite hasta que no queden pares, y el sed final limpia sobrantes.
+  VER=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' \
+    | sed -E ':a; s/\([^()]*\)//g; ta' \
+    | sed 's/[()]//g; s/  */ /g; s/^ *//; s/ *$//')
   [ -z "$VER" ] && continue
   {
     echo "------------------------------------------------"
@@ -271,21 +285,37 @@ else
   }
 
   # util: conecta a IP:PORT con timeout -> exit 0 si el TCP abre
-  # [fix 4] IP/puerto/payload via argv ($_), NUNCA interpolados en el string del bash -c
-  tcp_open() { timeout "${3:-3}" bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$1" "$2" 2>/dev/null; }
+  # ip/port/payload van como argv al sub-bash (no interpolados en el string del comando):
+  # asi una comilla o metacaracter en el valor no puede romper ni inyectar en el comando.
+  tcp_open() {
+    local ip="$1" port="$2" t="${3:-3}"
+    timeout "$t" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$ip" "$port" 2>/dev/null
+  }
   # util: envia payload crudo por TCP y devuelve la respuesta
-  tcp_send() { timeout "${4:-6}" bash -c 'exec 3<>/dev/tcp/$1/$2; printf "%b" "$3" >&3; cat <&3' _ "$1" "$2" "$3" 2>/dev/null; }
+  tcp_send() {
+    local ip="$1" port="$2" payload="$3" t="${4:-6}"
+    timeout "$t" bash -c 'exec 3<>"/dev/tcp/$0/$1"; printf "%b" "$2" >&3; cat <&3' "$ip" "$port" "$payload" 2>/dev/null
+  }
 
   # 4a) nmap NSE: scripts de vulnerabilidad sobre TODOS los puertos abiertos (prueba activa real)
   OPENPORTS=$(echo "$SERVICIOS" | cut -d/ -f1 | paste -sd, -)
   NSE_OUT="$BITACORA/nmap_vuln.txt"
   step_run "nmap NSE vuln scripts (puertos: $OPENPORTS)" "nmap -Pn -sV --script 'vuln and not dos' -p '$OPENPORTS' -oN '$NSE_OUT' '$IP' >/dev/null 2>&1"
-  # [fix 1] solo la linea de cabecera de script (un espacio tras '|', no las lineas
-  # de detalle indentadas) actualiza cur; [fix 2] exclusion de negativas case-insensitive
-  awk '/^\|[ _]/ {
-    if (match($0, /^\|[ ]?[^ |:]+:/)) { cur=substr($0, RSTART+2, RLENGTH-3); gsub(/^[ ]+|[ ]+$/, "", cur) }
-    if (tolower($0) ~ /vulnerable/ && tolower($0) !~ /not vulnerable|does not appear|appears not/ && cur != "") print cur
-  }' "$NSE_OUT" | sort -u | while read -r v; do
+  # NOTA sobre este awk (reescrito):
+  # 1) antes "cur" (nombre del script/CVE) se pisaba con lineas de detalle como "|   State:"
+  #    o "|   IDs:" porque la regex de cabecera no distinguia nivel de indentacion. Ahora solo
+  #    se toma como cabecera una linea "| algo:" SIN indentacion extra despues del "| ".
+  # 2) [Nn]ot vulnerable solo variaba la 1ra letra: nunca excluia "State: NOT VULNERABLE" (todo
+  #    mayusculas, el formato real de nmap), lo que generaba un VULNERABLE falso de una linea
+  #    que decia literalmente lo contrario. Ahora la comparacion es case-insensitive de verdad.
+  awk '
+    /^[0-9]+\/tcp/ { cur=""; next }
+    /^\|_?[ ][^ ]/ {
+      line=$0; sub(/^\|_?/,"",line); sub(/^ /,"",line)
+      if (line ~ /^[A-Za-z0-9_.-]+:[ ]*$/) { cur=line; sub(/:[ ]*$/,"",cur); next }
+    }
+    tolower($0) ~ /vulnerable/ && tolower($0) !~ /not vulnerable/ && cur != "" { print cur }
+  ' "$NSE_OUT" | sort -u | while read -r v; do
     report VULNERABLE "$IP (NSE: $v)" "nmap --script 'vuln and not dos' contra puertos abiertos" "script NSE reporta VULNERABLE (detalle: nmap_vuln.txt)"
   done
   grep -q 'VULNERABLE' "$NSE_OUT" 2>/dev/null || say "NSE: ningun script reporto VULNERABLE (pruebas ejecutadas, todas negativas)"
@@ -294,22 +324,26 @@ else
   while IFS= read -r line; do
     PORT=$(echo "$line" | cut -d/ -f1)
     SVC=$(echo "$line" | awk '{print $3}')
-    VER=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' | sed -E 's/\([^)]*\)//g; s/\([^)]*\)//g; s/[()]//g; s/  +/ /g; s/^ //; s/ $//')
+    # s/([^)]*)//g sola dejaba un ")" suelto con parentesis anidados tipo "((Ubuntu))" (comun en
+    # nmap). El bucle :a;...;ta repite hasta que no queden pares, y el sed final limpia sobrantes.
+    VER=$(echo "$line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i; print ""}' \
+      | sed -E ':a; s/\([^()]*\)//g; ta' \
+      | sed 's/[()]//g; s/  */ /g; s/^ *//; s/ *$//')
 
     case "$SVC" in
     ftp)
       # vsftpd 2.3.4: el backdoor abre 6200 tras un login malicioso. Se prueba de verdad.
       if echo "$VER" | grep -q 'vsftpd 2\.3\.4'; then
-        # [fix 6] baseline: si 6200 ya estaba abierto ANTES del trigger, la prueba no
-        # puede atribuirlo al backdoor -> INDETERMINADO, nunca un VULNERABLE falso
-        if tcp_open "$IP" 6200 2; then
-          say "INDETERMINADO  :$PORT ftp (vsftpd 2.3.4) | prueba: baseline de 6200 pre-trigger | evidencia: 6200 ya estaba ABIERTO antes del login malicioso: no atribuible al backdoor"
+        # baseline ANTES del trigger: si 6200 ya estaba abierto por otra razon, el chequeo
+        # posterior no prueba nada (antes no habia baseline -> falso VULNERABLE posible)
+        if tcp_open "$IP" 6200 1; then
+          report HECHO ":$PORT ftp (vsftpd 2.3.4)" "chequeo baseline de 6200 (previo al trigger)" "6200 YA estaba abierto antes del login: prueba no concluyente, revisar manualmente"
         else
           tcp_send "$IP" "$PORT" 'USER t:)\r\nPASS x\r\nQUIT\r\n' 6 >/dev/null 2>&1; sleep 3
           if tcp_open "$IP" 6200 2; then
-            report VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "login 'USER t:)' + intento de conexion a 6200" "6200 cerrado antes, ABIERTO tras el login malicioso: backdoor confirmado"
+            report VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "baseline 6200 cerrado + login 'USER t:)' + intento de conexion a 6200" "puerto 6200 ABIERTO tras el login malicioso (cerrado antes): backdoor confirmado"
           else
-            report NO_VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "login 'USER t:)' + intento de conexion a 6200" "6200 cerrado: el backdoor no se activo"
+            report NO_VULNERABLE ":$PORT ftp (vsftpd 2.3.4)" "baseline 6200 cerrado + login 'USER t:)' + intento de conexion a 6200" "6200 sigue cerrado: el backdoor no se activo"
           fi
         fi
       fi
@@ -328,39 +362,37 @@ else
         report HECHO ":$PORT ftp" "login anonymous / a@b.c" "230 login correcto: FTP anonimo activo"
       fi
       ;;
-    http|https|http-alt|http-proxy|https-alt)
-      # [fix 3] esquema detectado por puerto, no hardcodeado
-      SC4=$(scheme_for "$IP" "$PORT")
+    http|https|http-alt|http-proxy)
+      SCH=$(http_scheme "$line" "$PORT")
       # Spring Boot actuator expuesto
       for path in /actuator/heapdump /actuator/env; do
-        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$SC4$IP:$PORT$path")
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$SCH://$IP:$PORT$path")
         if [ "$code" = "200" ]; then
-          report VULNERABLE ":$PORT http" "GET $path" "HTTP 200: actuator expuesto"
+          report VULNERABLE ":$PORT $SCH" "GET $path" "HTTP 200: actuator expuesto"
         else
-          report NO_VULNERABLE ":$PORT http" "GET $path" "HTTP $code"
+          report NO_VULNERABLE ":$PORT $SCH" "GET $path" "HTTP $code"
         fi
       done
       # Tomcat manager sin credenciales
-      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$SC4$IP:$PORT/manager/html")
+      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$SCH://$IP:$PORT/manager/html")
       if [ "$code" = "200" ]; then
-        report VULNERABLE ":$PORT http (tomcat)" "GET /manager/html sin credenciales" "HTTP 200: manager accesible"
+        report VULNERABLE ":$PORT $SCH (tomcat)" "GET /manager/html sin credenciales" "HTTP 200: manager accesible"
       else
-        report NO_VULNERABLE ":$PORT http (tomcat)" "GET /manager/html sin credenciales" "HTTP $code"
+        report NO_VULNERABLE ":$PORT $SCH (tomcat)" "GET /manager/html sin credenciales" "HTTP $code"
       fi
       # WebDAV: PROPFIND y PUT anonimo (la escritura es lo explotable)
-      code=$(curl -sk -X PROPFIND -H 'Depth: 0' -o /dev/null -w '%{http_code}' --max-time 8 "$SC4$IP:$PORT/")
+      code=$(curl -sk -X PROPFIND -H 'Depth: 0' -o /dev/null -w '%{http_code}' --max-time 8 "$SCH://$IP:$PORT/")
       if [ "$code" = "207" ]; then
-        PUTCODE=$(curl -sk -X PUT -d 'davtest' -o /dev/null -w '%{http_code}' --max-time 8 "$SC4$IP:$PORT/davtest.txt")
+        PUTCODE=$(curl -sk -X PUT -d 'davtest' -o /dev/null -w '%{http_code}' --max-time 8 "$SCH://$IP:$PORT/davtest.txt")
         if [ "$PUTCODE" = "201" ] || [ "$PUTCODE" = "204" ]; then
-          report VULNERABLE ":$PORT http" "PROPFIND / (207) + PUT /davtest.txt" "HTTP $PUTCODE: WebDAV con escritura anonima"
+          report VULNERABLE ":$PORT $SCH" "PROPFIND / (207) + PUT /davtest.txt" "HTTP $PUTCODE: WebDAV con escritura anonima"
         else
-          report HECHO ":$PORT http" "PROPFIND / (207) + PUT /davtest.txt" "WebDAV activo pero PUT anonimo devolvio $PUTCODE (sin escritura)"
+          report HECHO ":$PORT $SCH" "PROPFIND / (207) + PUT /davtest.txt" "WebDAV activo pero PUT anonimo devolvio $PUTCODE (sin escritura)"
         fi
       fi
       ;;
     *)
-      # [fix 9] servicios sin sonda: decirlo explicitamente, no silencio
-      say ":$PORT $SVC ($VER) — SIN SONDA AUTOMATICA en esta version: solo NSE lo cubrio. Analizar a mano con el tutor."
+      echo -e "    ${DIM}sin sonda automatica para '$SVC' (:$PORT) — no se ejecuto ninguna prueba, revisar manualmente${NC}"
       ;;
     esac
   done <<< "$SERVICIOS"

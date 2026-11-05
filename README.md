@@ -27,15 +27,16 @@ El script **nunca emite suposiciones**. Un veredicto `VULNERABLE` / `NO_VULNERAB
 | 5 | feroxbuster (`--fuzz`) | rutas encontradas |
 | 6 | bitácora: `writeup.md`, `credentials.txt`, `errors.md`, `verificacion.txt`, `nmap_vuln.txt` | — |
 
-## Sondas activas (v3)
+## Sondas activas (v4)
 
-- vsftpd 2.3.4 — dispara el backdoor y comprueba si 6200 abre
+- vsftpd 2.3.4 — baseline de 6200 **antes** del trigger (anti falso VULNERABLE), luego login `USER :)` y conexión a 6200
 - ProFTPD mod_copy — `SITE CPFR` sin autenticar → 350
 - Spring Boot — `GET /actuator/heapdump` y `/actuator/env` → 200
 - Tomcat — `GET /manager/html` sin credenciales → 200
 - WebDAV — `PROPFIND /` → 207 + `PUT` anónimo → 201/204
 - FTP anónimo — login `anonymous` → 230 (HECHO probado)
 - nmap NSE `vuln and not dos` sobre todos los puertos abiertos
+- Servicios sin sonda: lo dicen explícitamente (nada de silencio)
 
 ## Uso
 
@@ -45,7 +46,7 @@ reconizer <IP> <nombre_maquina> [flags]
   --quick        top-1000 puertos
   --all          todos los puertos (default)
   --deep         -p- + -A (detección de OS)
-  --connect      -sT (para localhost/WSL)
+  --connect      -sT (para localhost/WSL), sin perder -sV
   --fuzz         feroxbuster en puertos HTTP
   --skip-nmap    reutiliza nmap.txt previo
   --skip-vuln    solo candidatos, sin verificación activa
@@ -66,6 +67,7 @@ Requisitos: `nmap`, `searchsploit` (exploitdb), `curl`; opcional `feroxbuster`.
 - **v1** — recon básico: nmap + sugerencias de vectores (modo tutor).
 - **v2** — + searchsploit por versión, feroxbuster, bitácora persistente.
 - **v3** — verificación ACTIVA con veredictos basados solo en pruebas ejecutadas; `--domain` con verificación DNS+HTTP; eliminadas todas las sugerencias genéricas.
+- **v4** — hardening tras auditoría de código (10 fixes): esquema http/https correcto por servicio/puerto (anti falso NO_VULNERABLE), baseline pre-trigger del backdoor vsftpd (anti falso VULNERABLE), parseo de paréntesis anidados con bucle sed, awk NSE reescrito (solo cabeceras, exclusión case-insensitive), `tcp_open`/`tcp_send` con ip/puerto/payload como argv, `--connect` sin matar `-sV`, validación de IP/nombre, servicios sin sonda explícitos, trap con PID exacto anti-procesos huérfanos.
 
 ## Aviso
 
