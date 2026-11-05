@@ -62,7 +62,10 @@ FLAGS:
   --quick        nmap solo top-1000 puertos (rapido)
   --deep         -p- + -A (deteccion de OS, traceroute)
   --connect      nmap con -sT (TCP connect scan) — usar para localhost/WSL
-  --fuzz         feroxbuster (common.txt) en cada puerto HTTP
+  --fuzz         feroxbuster en cada puerto HTTP (wordlist/extensiones se adaptan al Server: detectado)
+  --udp          nmap -sU top-puertos (NTP/SNMP/DNS/TFTP/...) ademas del escaneo TCP
+  --nuclei       corre nuclei (cves/exposures/default-logins) contra cada puerto HTTP (PASO 4c)
+  --shots        screenshot de cada puerto HTTP con gowitness (PASO 2c)
   --skip-nmap    no lanzar nmap: reusa <bitacora>/nmap.txt existente
   --skip-vuln    no lanzar la verificacion activa (PASO 4)
   --domain DOM   dominio a verificar contra la IP (el script NO inventa dominios:
@@ -70,11 +73,14 @@ FLAGS:
   --set-dir DIR  cambia el directorio base de las auditorias (se recuerda)
   --help         esta ayuda
 
+Las herramientas opcionales (--udp, --nuclei, --shots, --fuzz) se saltan con un aviso
+claro si el binario no esta instalado: nunca fallan en silencio, nunca inventan resultado.
+
 EJEMPLOS:
   reconizer 10.10.10.5 army --quick
-  reconizer 10.10.10.5 army --all --fuzz
+  reconizer 10.10.10.5 army --all --fuzz --udp
   reconizer 10.10.10.5 army --skip-nmap
-  reconizer 10.129.145.124 stream --domain htb-airport.htb
+  reconizer 10.129.145.124 stream --domain htb-airport.htb --nuclei --shots
 EOF
 }
 
@@ -82,6 +88,7 @@ EOF
 IP="${1:-}"; MAQ="${2:-}"
 if [ "$IP" = "--help" ] || [ "$IP" = "-h" ]; then usage; exit 0; fi
 MODE=all; FUZZ=0; SKIPNMAP=0; SKIPVULN=0; CONNECT=0; NEWDIR=0; SETDIR=""; DOMAIN=""
+UDP=0; NUCLEI=0; SHOTS=0
 if [ -z "$IP" ] || [ -z "$MAQ" ]; then usage; exit 1; fi
 # saneo basico: $IP se interpola en comandos bash -c mas abajo (nmap/curl/tcp_*).
 # Sin esto, un typo o copy-paste raro en la IP se ejecuta como shell.
@@ -99,6 +106,9 @@ while [ $# -gt 0 ]; do
     --deep)      MODE=deep; shift ;;
     --connect)   CONNECT=1; shift ;;
     --fuzz)      FUZZ=1; shift ;;
+    --udp)       UDP=1; shift ;;
+    --nuclei)    NUCLEI=1; shift ;;
+    --shots)     SHOTS=1; shift ;;
     --skip-nmap) SKIPNMAP=1; shift ;;
     --skip-vuln) SKIPVULN=1; shift ;;
     --domain)    DOMAIN="${2:-}"; shift 2 ;;
@@ -183,14 +193,53 @@ else
   # -sT y -sV NO son excluyentes en nmap (tipo de scan vs deteccion de version): antes este sed
   # borraba -sV por error, dejando VER vacio en PASO 3/4 y matando searchsploit entero con --connect.
   [ $CONNECT -eq 1 ] && OPTS="-sT $OPTS"
+  # guardo el resultado anterior ANTES de pisarlo, para poder mostrar que cambio desde la ultima corrida
+  [ -f "$NMAP_OUT" ] && cp "$NMAP_OUT" "$NMAP_OUT.prev"
   step_run "nmap escaneando" "nmap $OPTS -oN '$NMAP_OUT' '$IP'"
 fi
 
 SERVICIOS=$(grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT")
 NPORT=$(echo "$SERVICIOS" | grep -c .)
+
+# diff contra la corrida anterior del MISMO host (solo si hubo scan fresco y existe un .prev real)
+if [ -f "$NMAP_OUT.prev" ]; then
+  PREV_SVC=$(grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT.prev")
+  ADDED=$(comm -13 <(echo "$PREV_SVC" | sort) <(echo "$SERVICIOS" | sort))
+  REMOVED=$(comm -23 <(echo "$PREV_SVC" | sort) <(echo "$SERVICIOS" | sort))
+  if [ -n "$ADDED" ] || [ -n "$REMOVED" ]; then
+    say "PASO 1 diff: cambios desde la ultima corrida contra $IP"
+    [ -n "$ADDED" ]   && { echo -e "    ${GRN}+ nuevo:${NC}"; echo "$ADDED" | sed 's/^/      /'; }
+    [ -n "$REMOVED" ] && { echo -e "    ${RED}- ya no aparece:${NC}"; echo "$REMOVED" | sed 's/^/      /'; }
+  else
+    say "PASO 1 diff: sin cambios de puertos/servicios desde la ultima corrida"
+  fi
+fi
 echo
 say "servicios: ${GRN}${NPORT} puertos abiertos${NC}"
 echo "$SERVICIOS" | sed 's/^/    /'
+
+# ---------- PASO 1b: UDP (--udp) ----------
+# UDP sin respuesta es intrinsecamente ambiguo en nmap ("open|filtered": no se puede distinguir
+# puerto abierto sin servicio que responda de un firewall que dropea el paquete en silencio).
+# El script NO colapsa esa ambiguedad en un "abierto": muestra exactamente lo que nmap reporto.
+if [ $UDP -eq 1 ]; then
+  echo
+  UDP_OUT="$BITACORA/nmap_udp.txt"
+  step_run "nmap UDP (top 20 puertos: dns/snmp/ntp/tftp/...)" "nmap -sU -Pn --top-ports 20 -T4 -oN '$UDP_OUT' '$IP' >/dev/null 2>&1"
+  UDP_CONFIRMED=$(grep -E '^[0-9]+/udp\s+open\s' "$UDP_OUT" | grep -v 'open|filtered')
+  UDP_AMBIGUO=$(grep -E '^[0-9]+/udp\s+open\|filtered' "$UDP_OUT")
+  if [ -n "$UDP_CONFIRMED" ]; then
+    say "UDP: puertos ABIERTOS confirmados (respondieron) ${DIM}-> $UDP_OUT${NC}"
+    echo "$UDP_CONFIRMED" | sed 's/^/    /'
+  fi
+  if [ -n "$UDP_AMBIGUO" ]; then
+    warn "UDP: puertos open|filtered (SIN respuesta, no se afirma que esten abiertos; puede ser firewall) ${DIM}-> $UDP_OUT${NC}"
+    echo "$UDP_AMBIGUO" | sed 's/^/    /'
+  fi
+  [ -z "$UDP_CONFIRMED" ] && [ -z "$UDP_AMBIGUO" ] && say "UDP: nada abierto ni ambiguo en el top-20 (prueba ejecutada, resultado negativo)"
+  # la prueba ACTIVA de SNMP (comunidad 'public') va en PASO 4, junto al resto de veredictos
+  # (aqui en PASO 1b todavia no existe report()/VERIF_LOG, y debe respetar --skip-vuln)
+fi
 
 # ---------- PASO 2: recon HTTP (solo headers clave) ----------
 RAW_NMAP=$(cat "$NMAP_OUT")
@@ -202,9 +251,12 @@ for P in $PORTS_HTTP; do
   echo
   SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
   say "PASO 2: $SCH en :$P  ${DIM}(headers clave)${NC}"
-  curl -sik --max-time 10 "$SCH://$IP:$P/" 2>/dev/null \
-    | grep -iE '^(HTTP/|server:|location:|x-powered|content-type:)' | head -6 | sed 's/^/    /'
-  LOC=$(curl -sik --max-time 10 "$SCH://$IP:$P/" 2>/dev/null | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+  # una sola peticion real (antes se repetia la misma al tiro); se guarda cruda para que PASO 5
+  # (--fuzz) elija extensiones/wordlist en base a ESTA evidencia, sin inventar ni repetir la red
+  HDRS_OUT="$BITACORA/http_headers_$P.txt"
+  curl -sik --max-time 10 "$SCH://$IP:$P/" > "$HDRS_OUT" 2>/dev/null
+  grep -iE '^(HTTP/|server:|location:|x-powered|content-type:)' "$HDRS_OUT" | head -6 | sed 's/^/    /'
+  LOC=$(grep -i '^location:' "$HDRS_OUT" | tr -d '\r' | awk '{print $2}')
   if [ -n "$LOC" ]; then
     DOM=$(echo "$LOC" | grep -oE 'https?://[^/]+' | sed 's#https\?://##')
     warn "redirect -> $LOC  ${DIM}(posible vhost: $DOM)${NC}"
@@ -231,12 +283,47 @@ elif [ -n "$DOMAIN" ]; then
   warn "no hay puertos HTTP para probar el dominio '$DOMAIN': sin verificacion HTTP posible"
 fi
 
+# ---------- PASO 2c: screenshots (--shots) ----------
+if [ $SHOTS -eq 1 ]; then
+  echo
+  if ! command -v gowitness >/dev/null; then
+    warn "gowitness no instalado: screenshots se omiten (ver https://github.com/sensepost/gowitness)"
+  elif [ -z "$PORTS_HTTP" ]; then
+    say "PASO 2c: sin puertos HTTP detectados, nada que capturar"
+  else
+    SHOTS_DIR="$BITACORA/screenshots"; mkdir -p "$SHOTS_DIR"
+    for P in $PORTS_HTTP; do
+      SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
+      step_run "screenshot $SCH://:$P" "gowitness single --url '$SCH://$IP:$P/' --write-jsonl -d '$SHOTS_DIR' >/dev/null 2>&1"
+    done
+    NSHOTS=$(find "$SHOTS_DIR" -name '*.png' 2>/dev/null | wc -l)
+    ok "PASO 2c: ${NSHOTS} screenshot(s) guardados  ${DIM}-> $SHOTS_DIR${NC}"
+  fi
+fi
+
 # ---------- PASO 3: searchsploit (solo genera CANDIDATOS, no veredictos) ----------
 echo
 say "PASO 3: searchsploit por cada version  ${DIM}(CANDIDATOS, no veredictos)${NC}"
 SEARCH_LOG="$BITACORA/searchsploit.txt"
 SSTART=$(date +%s)
 : > "$SEARCH_LOG"
+# paralelizado con tope de jobs: cada puerto escribe a SU PROPIO archivo temporal (nunca al
+# mismo SEARCH_LOG al mismo tiempo que otro job -> sin interleaving/corrupcion), y al final se
+# concatenan en orden de puerto. Asi no reintroducimos la race condition que evitamos en 4a/4b.
+SS_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/reconizer_ss.XXXXXX")
+SS_MAXJOBS=4
+ss_job() {
+  local port="$1" svc="$2" ver="$3" tag="$4"
+  {
+    echo "------------------------------------------------"
+    echo "# puerto $port ($svc): $ver"
+    searchsploit "$ver" 2>/dev/null | head -10
+  } > "$SS_TMPDIR/block_$tag.txt"
+  local nexp
+  nexp=$(searchsploit --id "$ver" 2>/dev/null | grep -cE '\|')
+  echo -e "    ${YLW}[$port/$svc]${NC} $ver  ${DIM}-> ${nexp} exploits candidatos${NC}" > "$SS_TMPDIR/line_$tag.txt"
+}
+TAG=0
 while IFS= read -r line; do
   PORT=$(echo "$line" | cut -d/ -f1)
   SVC=$(echo "$line" | awk '{print $3}')
@@ -246,16 +333,17 @@ while IFS= read -r line; do
     | sed -E ':a; s/\([^()]*\)//g; ta' \
     | sed 's/[()]//g; s/  */ /g; s/^ *//; s/ *$//')
   [ -z "$VER" ] && continue
-  {
-    echo "------------------------------------------------"
-    echo "# puerto $PORT ($SVC): $VER"
-    searchsploit "$VER" 2>/dev/null | head -10
-  } >> "$SEARCH_LOG"
-  NEXP=$(searchsploit --id "$VER" 2>/dev/null | grep -cE '\|')
-  echo -e "    ${YLW}[$PORT/$SVC]${NC} $VER  ${DIM}-> ${NEXP} exploits candidatos${NC}"
+  TAG=$((TAG+1))
+  printf -v TAGP '%04d' "$TAG"   # zero-pad para que el glob posterior respete el orden
+  ss_job "$PORT" "$SVC" "$VER" "$TAGP" &
+  while [ "$(jobs -r -p | wc -l)" -ge "$SS_MAXJOBS" ]; do wait -n 2>/dev/null || sleep 0.2; done
 done <<< "$(grep -E '^[0-9]+/tcp\s+open' "$NMAP_OUT")"
+wait
+for f in "$SS_TMPDIR"/block_*.txt; do [ -f "$f" ] && cat "$f" >> "$SEARCH_LOG"; done
+for f in "$SS_TMPDIR"/line_*.txt; do [ -f "$f" ] && cat "$f"; done
+rm -rf "$SS_TMPDIR"
 SDUR=$(( $(date +%s) - SSTART ))
-ok "searchsploit  ${DIM}(${SDUR}s)${NC} -> $SEARCH_LOG"
+ok "searchsploit  ${DIM}(${SDUR}s, hasta ${SS_MAXJOBS} en paralelo)${NC} -> $SEARCH_LOG"
 warn "TODO lo anterior son CANDIDATOS (correlacion version/exploit en base de datos). El PASO 4 prueba en vivo y solo ese emite veredictos."
 
 # ---------- PASO 4: VERIFICACION ACTIVA (solo hechos probados contra el objetivo) ----------
@@ -269,8 +357,12 @@ else
   : > "$VERIF_LOG"
 
   # report <VULNERABLE|NO_VULNERABLE|HECHO> "<objetivo>" "<prueba ejecutada>" "<evidencia observada>"
+  # endurecido tras probarlo: si "ev" trae un salto de linea (una herramienta externa devolviendo
+  # algo multilinea donde se esperaba un escalar) NO debe partir el registro en VERIF_LOG, o los
+  # conteos por grep -c de PASO 6/hallazgos.md quedan mal. Se colapsa a una sola linea siempre.
   report() {
-    local state="$1" tgt="$2" t="$3" ev="$4"
+    local state="$1" tgt="$2" t="$3"
+    local ev; ev=$(printf '%s' "$4" | tr '\n' ' ' | sed 's/  */ /g; s/ *$//')
     case "$state" in
       VULNERABLE)
         ok "VULNERABLE  $tgt  ${DIM}| prueba: $t | evidencia: $ev${NC}"
@@ -297,30 +389,55 @@ else
     timeout "$t" bash -c 'exec 3<>"/dev/tcp/$0/$1"; printf "%b" "$2" >&3; cat <&3' "$ip" "$port" "$payload" 2>/dev/null
   }
 
+  # nse_vuln_findings <archivo> -> nombres de script/CVE que el NSE marco VULNERABLE en ese archivo.
+  # Logica compartida por 4a y por nse_run (4b): cur solo se toma de una cabecera "| algo:" SIN
+  # indentacion extra (evita pisar el nombre con lineas de detalle como "|   State:"), y la
+  # comparacion vulnerable/not-vulnerable es case-insensitive real (nmap escribe "NOT VULNERABLE"
+  # en mayusculas; un regex que solo variaba la 1ra letra dejaba pasar falsos VULNERABLE).
+  nse_vuln_findings() {
+    awk '
+      /^[0-9]+\/tcp/ { cur=""; next }
+      /^\|_?[ ][^ ]/ {
+        line=$0; sub(/^\|_?/,"",line); sub(/^ /,"",line)
+        if (line ~ /^[A-Za-z0-9_.-]+:[ ]*$/) { cur=line; sub(/:[ ]*$/,"",cur); next }
+      }
+      tolower($0) ~ /vulnerable/ && tolower($0) !~ /not vulnerable/ && cur != "" { print cur }
+    ' "$1" | sort -u
+  }
+
+  # nse_run PORT SCRIPTS TAG LABEL -> corre esos scripts NSE de verdad contra ese puerto,
+  # guarda el .txt crudo, reporta cada VULNERABLE real y un resumen de hallazgos informativos
+  # (shares, usuarios, banners...) con el archivo como evidencia citable.
+  nse_run() {
+    local port="$1" scripts="$2" tag="$3" label="$4"
+    local out="$BITACORA/nse_${tag}_${port}.txt"
+    step_run "$label" "nmap -Pn -sV --script '$scripts' -p '$port' -oN '$out' '$IP' >/dev/null 2>&1"
+    nse_vuln_findings "$out" | while read -r v; do
+      report VULNERABLE ":$port ($tag NSE: $v)" "nmap --script '$scripts' -p $port" "script NSE reporta VULNERABLE (detalle: $(basename "$out"))"
+    done
+    # lineas con contenido real (no cabeceras de puerto ni separadores) -> evidencia informativa
+    local info
+    info=$(grep -E '^\|' "$out" 2>/dev/null | grep -viE 'VULNERABLE|not vulnerable' | head -5)
+    if [ -n "$info" ]; then
+      report HECHO ":$port ($tag NSE)" "nmap --script '$scripts' -p $port" "salida real (primeras lineas, completo en $(basename "$out")): $(echo "$info" | tr '\n' ' ' | sed 's/  */ /g')"
+    fi
+  }
+
   # 4a) nmap NSE: scripts de vulnerabilidad sobre TODOS los puertos abiertos (prueba activa real)
   OPENPORTS=$(echo "$SERVICIOS" | cut -d/ -f1 | paste -sd, -)
   NSE_OUT="$BITACORA/nmap_vuln.txt"
   step_run "nmap NSE vuln scripts (puertos: $OPENPORTS)" "nmap -Pn -sV --script 'vuln and not dos' -p '$OPENPORTS' -oN '$NSE_OUT' '$IP' >/dev/null 2>&1"
-  # NOTA sobre este awk (reescrito):
-  # 1) antes "cur" (nombre del script/CVE) se pisaba con lineas de detalle como "|   State:"
-  #    o "|   IDs:" porque la regex de cabecera no distinguia nivel de indentacion. Ahora solo
-  #    se toma como cabecera una linea "| algo:" SIN indentacion extra despues del "| ".
-  # 2) [Nn]ot vulnerable solo variaba la 1ra letra: nunca excluia "State: NOT VULNERABLE" (todo
-  #    mayusculas, el formato real de nmap), lo que generaba un VULNERABLE falso de una linea
-  #    que decia literalmente lo contrario. Ahora la comparacion es case-insensitive de verdad.
-  awk '
-    /^[0-9]+\/tcp/ { cur=""; next }
-    /^\|_?[ ][^ ]/ {
-      line=$0; sub(/^\|_?/,"",line); sub(/^ /,"",line)
-      if (line ~ /^[A-Za-z0-9_.-]+:[ ]*$/) { cur=line; sub(/:[ ]*$/,"",cur); next }
-    }
-    tolower($0) ~ /vulnerable/ && tolower($0) !~ /not vulnerable/ && cur != "" { print cur }
-  ' "$NSE_OUT" | sort -u | while read -r v; do
+  nse_vuln_findings "$NSE_OUT" | while read -r v; do
     report VULNERABLE "$IP (NSE: $v)" "nmap --script 'vuln and not dos' contra puertos abiertos" "script NSE reporta VULNERABLE (detalle: nmap_vuln.txt)"
   done
   grep -q 'VULNERABLE' "$NSE_OUT" 2>/dev/null || say "NSE: ningun script reporto VULNERABLE (pruebas ejecutadas, todas negativas)"
 
   # 4b) sondas especificas por servicio: cada una ENVIA algo y OBSERVA la respuesta
+  # chequeo de binarios UNA sola vez (no por puerto) para no repetir el mismo warning N veces
+  HAVE_SMBCLIENT=0; command -v smbclient >/dev/null && HAVE_SMBCLIENT=1 || warn "smbclient no instalado: sondas SMB se omiten (apt install smbclient)"
+  HAVE_MYSQL=0;     command -v mysql     >/dev/null && HAVE_MYSQL=1     || warn "cliente mysql no instalado: sonda MySQL se omite (apt install mysql-client)"
+  HAVE_REDIS=0;     command -v redis-cli >/dev/null && HAVE_REDIS=1     || warn "redis-cli no instalado: sonda Redis se omite (apt install redis-tools)"
+
   while IFS= read -r line; do
     PORT=$(echo "$line" | cut -d/ -f1)
     SVC=$(echo "$line" | awk '{print $3}')
@@ -362,8 +479,65 @@ else
         report HECHO ":$PORT ftp" "login anonymous / a@b.c" "230 login correcto: FTP anonimo activo"
       fi
       ;;
+    microsoft-ds|netbios-ssn)
+      # scripts NSE de verdad (no la categoria 'vuln' generica de 4a, que no cubre enum/discovery)
+      nse_run "$PORT" 'smb-os-discovery,smb-enum-shares,smb-enum-users,smb2-security-mode,smb-vuln-ms17-010,smb-vuln-ms08-067' smb "nmap scripts SMB :$PORT"
+      # sesion nula real con smbclient: hecho probado, no inferido del banner
+      if [ $HAVE_SMBCLIENT -eq 1 ]; then
+        RESP=$(timeout 10 smbclient -L "//$IP" -N -m SMB2 2>&1)
+        if echo "$RESP" | grep -qiE 'Sharename|Disk\s*\|'; then
+          report HECHO ":$PORT smb" "smbclient -L //$IP -N (sesion nula)" "listado de shares obtenido sin credenciales"
+        else
+          report NO_VULNERABLE ":$PORT smb" "smbclient -L //$IP -N (sesion nula)" "sin listado de shares (respuesta: $(echo "$RESP" | head -1))"
+        fi
+      fi
+      ;;
+    mysql)
+      nse_run "$PORT" 'mysql-info,mysql-empty-password,mysql-databases,mysql-users' mysql "nmap scripts MySQL :$PORT"
+      if [ $HAVE_MYSQL -eq 1 ]; then
+        RESP=$(timeout 8 mysql -h "$IP" -P "$PORT" -u root --connect-timeout=5 -e 'select 1' 2>&1)
+        if echo "$RESP" | grep -q '^1$'; then
+          report VULNERABLE ":$PORT mysql" "login 'root' sin password (mysql -u root -e 'select 1')" "login exitoso sin credenciales"
+        else
+          report NO_VULNERABLE ":$PORT mysql" "login 'root' sin password" "login rechazado (respuesta: $(echo "$RESP" | head -1))"
+        fi
+      fi
+      ;;
+    redis)
+      if [ $HAVE_REDIS -eq 1 ]; then
+        RESP=$(timeout 8 redis-cli -h "$IP" -p "$PORT" --no-raw ping 2>&1)
+        if echo "$RESP" | grep -q 'PONG'; then
+          report VULNERABLE ":$PORT redis" "redis-cli -h $IP ping (sin auth)" "respuesta PONG sin autenticacion: acceso no autenticado confirmado"
+          CFG=$(timeout 8 redis-cli -h "$IP" -p "$PORT" --no-raw config get dir 2>&1 | tail -1)
+          [ -n "$CFG" ] && report HECHO ":$PORT redis" "redis-cli config get dir (tras ping sin auth)" "dir configurado: $CFG"
+        else
+          report NO_VULNERABLE ":$PORT redis" "redis-cli -h $IP ping (sin auth)" "sin PONG (respuesta: $(echo "$RESP" | head -1))"
+        fi
+      fi
+      ;;
     http|https|http-alt|http-proxy)
       SCH=$(http_scheme "$line" "$PORT")
+      # nuclei (--nuclei): motor adicional de verificacion activa con templates mas frescos
+      # que la categoria 'vuln' de nmap. Cada hallazgo que imprime viene de una petición real
+      # con matcher cumplido, asi que se reporta VULNERABLE con la evidencia tal cual la dio.
+      if [ $NUCLEI -eq 1 ]; then
+        if command -v nuclei >/dev/null; then
+          NUC_OUT="$BITACORA/nuclei_${PORT}.jsonl"
+          step_run "nuclei :$PORT ($SCH)" "nuclei -u '$SCH://$IP:$PORT' -t cves/,exposures/,default-logins/ -silent -jsonl-export '$NUC_OUT' >/dev/null 2>&1"
+          if [ -s "$NUC_OUT" ]; then
+            while IFS= read -r nline; do
+              NID=$(echo "$nline" | grep -oE '"template-id":"[^"]*"' | head -1 | cut -d'"' -f4)
+              NMATCHED=$(echo "$nline" | grep -oE '"matched-at":"[^"]*"' | head -1 | cut -d'"' -f4)
+              [ -z "$NID" ] && NID="(sin template-id, ver $NUC_OUT)"
+              report VULNERABLE ":$PORT $SCH (nuclei: $NID)" "nuclei -t cves/,exposures/,default-logins/" "matcher cumplido en $NMATCHED (detalle: $(basename "$NUC_OUT"))"
+            done < "$NUC_OUT"
+          else
+            report NO_VULNERABLE ":$PORT $SCH (nuclei)" "nuclei -t cves/,exposures/,default-logins/" "ningun template dio match"
+          fi
+        else
+          warn "nuclei no instalado: sonda nuclei se omite en :$PORT (ver https://github.com/projectdiscovery/nuclei)"
+        fi
+      fi
       # Spring Boot actuator expuesto
       for path in /actuator/heapdump /actuator/env; do
         code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "$SCH://$IP:$PORT$path")
@@ -397,6 +571,21 @@ else
     esac
   done <<< "$SERVICIOS"
 
+  # 4c) SNMP (solo si --udp confirmo 161/udp open de verdad, no open|filtered): comunidad 'public'
+  UDP_OUT="$BITACORA/nmap_udp.txt"
+  if [ $UDP -eq 1 ] && [ -f "$UDP_OUT" ] && grep -qE '^161/udp\s+open\s' "$UDP_OUT" && ! grep -qE '^161/udp\s+open\|filtered' "$UDP_OUT"; then
+    if command -v snmpget >/dev/null; then
+      SNMP_RESP=$(timeout 6 snmpget -v2c -c public -r 1 -t 3 "$IP" 1.3.6.1.2.1.1.1.0 2>&1)
+      if echo "$SNMP_RESP" | grep -qiE 'STRING|OID|Hex-STRING'; then
+        report VULNERABLE ":161/udp snmp" "snmpget -v2c -c public sysDescr (1.3.6.1.2.1.1.1.0)" "respondio sin credenciales reales: $(echo "$SNMP_RESP" | head -1)"
+      else
+        report NO_VULNERABLE ":161/udp snmp" "snmpget -v2c -c public sysDescr" "sin respuesta valida (community 'public' rechazada o timeout)"
+      fi
+    else
+      warn "snmpget no instalado: sonda SNMP se omite (apt install snmp)"
+    fi
+  fi
+
   NCONF=$(grep -c '^\[VULNERABLE\]' "$VERIF_LOG")
   ok "verificacion: ${GRN}${NCONF} vulnerabilidades CONFIRMADAS por prueba activa${NC} -> $VERIF_LOG"
 fi
@@ -407,14 +596,38 @@ if [ $FUZZ -eq 1 ]; then
   if ! command -v feroxbuster >/dev/null; then
     warn "feroxbuster no instalado (sudo apt install feroxbuster) — saltando"
   else
-    for P in $PORTS_HTTP; do
-      say "PASO 5: feroxbuster en :$P"
-      FUZZOUT="$BITACORA/ferox_$P.txt"
-      step_run "fuzz :$P" "feroxbuster -u 'http://$IP:$P/' -w /usr/share/seclists/Discovery/Web-Content/common.txt -S 178 -n -d 1 >'$FUZZOUT' 2>&1"
-      NF=$(grep -cE '^\s*(200|201|204|301|302|307|401|403|405|500)' "$FUZZOUT" 2>/dev/null || echo 0)
-      ok "rutas interesantes en :$P: ${NF}  ${DIM}->$FUZZOUT${NC}"
-      grep -E '^\s*(200|201|204|301|302|307|401|403|405|500)' "$FUZZOUT" 2>/dev/null | head -10 | sed 's/^/      /'
+    # wordlist: la de siempre si existe; si no, probar un par de alternativas comunes de Kali
+    # en vez de fallar en seco con un path que puede no existir segun la instalacion.
+    WORDLIST=""
+    for wl in /usr/share/seclists/Discovery/Web-Content/common.txt \
+              /usr/share/seclists/Discovery/Web-Content/raft-small-words.txt \
+              /usr/share/wordlists/dirb/common.txt; do
+      [ -f "$wl" ] && { WORDLIST="$wl"; break; }
     done
+    if [ -z "$WORDLIST" ]; then
+      warn "ninguna wordlist conocida encontrada (seclists/dirb) — PASO 5 se omite, instalar seclists"
+    else
+      for P in $PORTS_HTTP; do
+        SCH=$(http_scheme "$(echo "$SERVICIOS" | grep "^$P/tcp")" "$P")
+        # extensiones: del header REAL que ya guardo PASO 2 para este puerto (no se inventa nada;
+        # si no hay evidencia de tecnologia, se fuzz sin -x en vez de asumir una pila al azar)
+        EXT=""
+        HDRS_OUT="$BITACORA/http_headers_$P.txt"
+        if [ -f "$HDRS_OUT" ]; then
+          if grep -qi 'X-Powered-By:.*PHP\|\.php' "$HDRS_OUT"; then EXT="php"
+          elif grep -qi 'X-Powered-By:.*ASP\|Server:.*IIS' "$HDRS_OUT"; then EXT="asp,aspx"
+          elif grep -qi 'Server:.*Jetty\|Server:.*Tomcat' "$HDRS_OUT"; then EXT="jsp,do,action"
+          fi
+        fi
+        EXTOPT=""; [ -n "$EXT" ] && EXTOPT="-x $EXT"
+        say "PASO 5: feroxbuster en $SCH://:$P  ${DIM}(wordlist: $(basename "$WORDLIST")${EXT:+, ext: $EXT})${NC}"
+        FUZZOUT="$BITACORA/ferox_$P.txt"
+        step_run "fuzz :$P" "feroxbuster -u '$SCH://$IP:$P/' -w '$WORDLIST' $EXTOPT -k -S 178 -n -d 1 >'$FUZZOUT' 2>&1"
+        NF=$(grep -cE '^\s*(200|201|204|301|302|307|401|403|405|500)' "$FUZZOUT" 2>/dev/null || echo 0)
+        ok "rutas interesantes en :$P: ${NF}  ${DIM}->$FUZZOUT${NC}"
+        grep -E '^\s*(200|201|204|301|302|307|401|403|405|500)' "$FUZZOUT" 2>/dev/null | head -10 | sed 's/^/      /'
+      done
+    fi
   fi
 fi
 
@@ -429,11 +642,48 @@ Fecha: $(date +%Y-%m-%d) | Estado: EN CURSO
 ## Fase 0 - Recon (reconizer $(date +%H:%M), modo $MODE)
 $(echo "$SERVICIOS" | sed 's/^/    /')
 
+Hallazgos automaticos de cada corrida: ver hallazgos.md (ese archivo se regenera solo, tus
+notas de aqui en writeup.md NO se tocan).
+
 ## Fase 1 -
 WEOF
 [ -f "$BITACORA/credentials.txt" ] || echo "=== CREDENCIALES - $MAQ ($IP) ===" > "$BITACORA/credentials.txt"
 [ -f "$BITACORA/errors.md" ] || printf "# errors.md - $MAQ\n# error -> causa -> correccion -> leccion\n" > "$BITACORA/errors.md"
-ok "writeup.md / credentials.txt / errors.md listos"
+
+# hallazgos.md SI se regenera siempre (writeup.md no, para no pisar notas manuales del usuario)
+HALLAZGOS_MD="$BITACORA/hallazgos.md"
+{
+  echo "# Hallazgos automaticos - $MAQ ($IP)"
+  echo
+  echo "_Regenerado por reconizer el $(date '+%Y-%m-%d %H:%M'). Archivo auto-generado: no editar,_"
+  echo "_se sobreescribe en cada corrida. Las notas propias van en writeup.md._"
+  echo
+  if [ -f "$VERIF_LOG" ]; then
+    NV=$(grep -c '^\[VULNERABLE\]' "$VERIF_LOG")
+    echo "## VULNERABLE confirmados por prueba activa ($NV)"
+    if [ "$NV" -gt 0 ]; then
+      grep '^\[VULNERABLE\]' "$VERIF_LOG" | sed 's/^\[VULNERABLE\] /- /'
+    else
+      echo "_ninguno (pruebas ejecutadas, todas negativas)_"
+    fi
+    echo
+    NH=$(grep -c '^\[HECHO\]' "$VERIF_LOG")
+    echo "## HECHO - observado y probado, no es veredicto de CVE ($NH)"
+    if [ "$NH" -gt 0 ]; then
+      grep '^\[HECHO\]' "$VERIF_LOG" | sed 's/^\[HECHO\] /- /'
+    else
+      echo "_ninguno_"
+    fi
+  else
+    echo "_PASO 4 no se ejecuto (--skip-vuln): sin veredictos en esta corrida._"
+  fi
+  echo
+  echo "## Candidatos de searchsploit (CORRELACION version/exploit, sin confirmar activamente)"
+  echo "Detalle completo en \`searchsploit.txt\`. Un candidato aqui NO implica que sea explotable:"
+  echo "solo los items de la seccion VULNERABLE arriba fueron probados contra el objetivo."
+} > "$HALLAZGOS_MD"
+
+ok "writeup.md / hallazgos.md / credentials.txt / errors.md listos"
 
 TOTAL=$(( $(date +%s) - T0 ))
 echo

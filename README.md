@@ -68,6 +68,7 @@ Requisitos: `nmap`, `searchsploit` (exploitdb), `curl`; opcional `feroxbuster`.
 - **v2** — + searchsploit por versión, feroxbuster, bitácora persistente.
 - **v3** — verificación ACTIVA con veredictos basados solo en pruebas ejecutadas; `--domain` con verificación DNS+HTTP; eliminadas todas las sugerencias genéricas.
 - **v4** — hardening tras auditoría de código (10 fixes): esquema http/https correcto por servicio/puerto (anti falso NO_VULNERABLE), baseline pre-trigger del backdoor vsftpd (anti falso VULNERABLE), parseo de paréntesis anidados con bucle sed, awk NSE reescrito (solo cabeceras, exclusión case-insensitive), `tcp_open`/`tcp_send` con ip/puerto/payload como argv, `--connect` sin matar `-sV`, validación de IP/nombre, servicios sin sonda explícitos, trap con PID exacto anti-procesos huérfanos.
+- **v5** — expansión de cobertura y pruebas: sondas SMB/MySQL/Redis/SNMP con binarios reales (smbclient sesión nula, mysql root sin password, redis PING/CONFIG, snmpget community public), scripts NSE dedicados por servicio (`nse_run` reutilizable), `--udp` (top-20, separa `open` confirmado de `open|filtered` ambiguo), `--nuclei` (JSONL con template-id/matched-at como evidencia), `--shots` (gowitness), fuzzing adaptativo al `Server:` detectado, searchsploit paralelo (×4), diff entre corridas, `hallazgos.md` auto-regenerado (writeup.md intacto), hardening de `report()` contra newlines.
 
 ## Aviso
 
